@@ -1,5 +1,8 @@
 #include "MidiOutput.h"
 
+#include "OutputTiming.h"
+
+#include "../ThreadQos.h"
 #include "../TimecodeEngine.h"
 
 #include <RtMidi.h>
@@ -81,12 +84,17 @@ std::vector<std::string> MidiOutput::availablePorts() {
 }
 
 void MidiOutput::applyConfig(const MidiSettings& config) {
+    // Reopening a MIDI port is expensive; only do it when the port itself
+    // changed. fps / live fields are picked up at the next poll tick.
+    bool portChanged = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        portChanged = (config.portName          != config_.portName)
+                   || (config.createVirtualPort != config_.createVirtualPort);
         config_ = config;
-        configDirty_ = true;
+        if (portChanged) configDirty_ = true;
     }
-    cv_.notify_all();
+    if (portChanged) cv_.notify_all();
 
     if (config.enabled && !running_.load()) {
         shouldStop_ = false;
@@ -113,6 +121,7 @@ std::string MidiOutput::status() const {
 }
 
 void MidiOutput::threadMain() {
+    setHighPriorityForOutputThread();
     using clock = std::chrono::steady_clock;
 
     auto openPort = [this](const MidiSettings& cfg) {
@@ -198,6 +207,7 @@ void MidiOutput::threadMain() {
             }
             piece = 0;
             haveLocked = false;
+            next = clock::now();
         }
 
         const auto snap = engine_.snapshot();
@@ -207,13 +217,13 @@ void MidiOutput::threadMain() {
         // the same TC value (sampled at piece 0). Re-sample only on piece 0.
         if (piece == 0 || stateChanged || !haveLocked) {
             const TimecodeFields nowTc = secondsToFields(snap.playheadSeconds, cfg.fps);
-            const int nowFn = ((nowTc.hours * 60 + nowTc.minutes) * 60 + nowTc.seconds)
-                              * nowTc.integerFps + nowTc.frames;
+            const int nowFn = output_timing::labelFrameNumber(nowTc);
 
             // Expected step between locked captures during continuous playback
-            // is +2 frames. Anything beyond that is a jump.
+            // is two frames at varispeed-adjusted quarter-frame cadence.
+            const int expectedStep = (snap.rate < -output_timing::kMinActiveRate) ? -2 : 2;
             const bool bigJump = haveLocked
-                              && std::abs(nowFn - lockedFrameNumber - 2) > 2;
+                              && std::abs((nowFn - lockedFrameNumber) - expectedStep) > 2;
 
             if (stateChanged || bigJump || !haveLocked) {
                 try { sendFullFrame(*midi_, nowTc, mtcRateCode(cfg.fps)); }
@@ -240,15 +250,14 @@ void MidiOutput::threadMain() {
             piece = (piece + 1) & 0x07;
         }
 
-        const double fps = frameRateInfo(cfg.fps).nominalFps;
-        const auto interval = std::chrono::duration_cast<clock::duration>(
-            std::chrono::duration<double>(1.0 / std::max(1.0, fps * 4.0)));
+        const auto interval = output_timing::quarterFrameInterval(snap, cfg.fps);
         next += interval;
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait_until(lock, next, [this] {
             return shouldStop_.load() || configDirty_.load();
         });
-        if (clock::now() > next + std::chrono::seconds(1)) next = clock::now();
+        const auto now = clock::now();
+        if (now > next + interval) next = now;
     }
 
     midi_.reset();

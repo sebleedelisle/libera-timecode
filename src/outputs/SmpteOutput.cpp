@@ -1,5 +1,8 @@
 #include "SmpteOutput.h"
 
+#include "OutputTiming.h"
+
+#include "../ThreadQos.h"
 #include "../TimecodeEngine.h"
 
 #include <RtAudio.h>
@@ -8,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cmath>
 
 namespace libera_timecode {
 
@@ -31,6 +35,40 @@ double effectiveFpsForLtc(FrameRate r) {
     // but we still need correct sample-per-frame allocation. Use the nominal
     // rate so audio length tracks real-time.
     return frameRateInfo(r).nominalFps;
+}
+
+bool encodeLtcFrame(LTCEncoder* enc, const TimecodeFields& tc,
+                    LTC_TV_STANDARD standard, double speed) {
+    if (!enc) return false;
+    if (!std::isfinite(speed) || speed <= 0.0) speed = 1.0;
+
+    SMPTETimecode smpte;
+    std::memset(&smpte, 0, sizeof(smpte));
+    std::strncpy(smpte.timezone, "+0000", sizeof(smpte.timezone) - 1);
+    smpte.years = 0; smpte.months = 1; smpte.days = 1;
+    smpte.hours = static_cast<unsigned char>(tc.hours);
+    smpte.mins  = static_cast<unsigned char>(tc.minutes);
+    smpte.secs  = static_cast<unsigned char>(tc.seconds);
+    smpte.frame = static_cast<unsigned char>(tc.frames);
+    ltc_encoder_set_timecode(enc, &smpte);
+
+    LTCFrame frame;
+    ltc_encoder_get_frame(enc, &frame);
+    frame.dfbit = tc.dropFrame ? 1 : 0;
+    ltc_frame_set_parity(&frame, standard);
+    ltc_encoder_set_frame(enc, &frame);
+
+    int err = 0;
+    for (int byte = 0; byte < 10; ++byte) {
+        err |= ltc_encoder_encode_byte(enc, byte, speed);
+    }
+    return err == 0;
+}
+
+long long frameIndexForSeconds(double seconds, FrameRate fps) {
+    if (!std::isfinite(seconds) || seconds < 0.0) seconds = 0.0;
+    return static_cast<long long>(
+        std::floor(seconds * frameRateInfo(fps).nominalFps + 1.0e-9));
 }
 
 } // namespace
@@ -57,10 +95,17 @@ std::vector<std::string> SmpteOutput::availableAudioDevices() {
 }
 
 void SmpteOutput::applyConfig(const SmpteSettings& config) {
+    // Live params (level, channelMode) are read from config_ inside the audio
+    // callback every block, so they don't need a stream restart. Restarting
+    // RtAudio is only needed for sampleRate, audioDevice, or fps changes.
+    bool streamChanged = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        streamChanged = (config.sampleRate  != config_.sampleRate)
+                     || (config.audioDevice != config_.audioDevice)
+                     || (config.fps         != config_.fps);
         config_ = config;
-        configDirty_ = true;
+        if (streamChanged) configDirty_ = true;
     }
     if (config.enabled && !running_.load()) {
         shouldStop_ = false;
@@ -142,8 +187,8 @@ bool SmpteOutput::openStream(const SmpteSettings& cfg) {
         return false;
     }
 
-    enc_ = ltc_encoder_create(sampleRate, effectiveFpsForLtc(cfg.fps),
-                              ltcStandardForFps(cfg.fps), 0);
+    const double ltcFps = effectiveFpsForLtc(cfg.fps);
+    enc_ = ltc_encoder_create(sampleRate, ltcFps, ltcStandardForFps(cfg.fps), 0);
     if (!enc_) {
         std::lock_guard<std::mutex> lock(mutex_);
         lastError_ = "ltc_encoder_create failed";
@@ -152,9 +197,23 @@ bool SmpteOutput::openStream(const SmpteSettings& cfg) {
         audio_.reset();
         return false;
     }
-    ltcBuf_.assign(8192, 128);
+    if (ltc_encoder_set_buffersize(enc_, sampleRate, ltcFps * 0.5) != 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastError_ = "ltc_encoder_set_buffersize failed";
+        ltc_encoder_free(enc_);
+        enc_ = nullptr;
+        audio_->stopStream();
+        audio_->closeStream();
+        audio_.reset();
+        return false;
+    }
+    ltcBuf_.assign(std::max<std::size_t>(ltc_encoder_get_buffersize(enc_), 1), 128);
     ltcBufFill_ = ltcBufRead_ = 0;
     frameNumberLastEncoded_ = -1;
+    ltcTimelineValid_ = false;
+    ltcTimelineActive_ = false;
+    ltcTimelineFrameIndex_ = 0;
+    ltcTimelineFps_ = cfg.fps;
     channelsOpen_ = 2;
 
     {
@@ -179,9 +238,11 @@ void SmpteOutput::closeStream() {
     }
     ltcBuf_.clear();
     ltcBufFill_ = ltcBufRead_ = 0;
+    ltcTimelineValid_ = false;
 }
 
 void SmpteOutput::controlThreadMain() {
+    setHighPriorityForOutputThread();
     SmpteSettings cfgLocal;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -234,21 +295,56 @@ int SmpteOutput::audioCallback(void* outputBuffer, void* /*inputBuffer*/,
         if (self->ltcBufRead_ >= self->ltcBufFill_) {
             // Need to encode another LTC frame.
             if (self->enc_) {
-                const double seconds = self->engine_.currentSeconds();
-                const TimecodeFields tc = secondsToFields(seconds, cfg.fps);
-                SMPTETimecode smpte;
-                std::memset(&smpte, 0, sizeof(smpte));
-                std::strncpy(smpte.timezone, "+0000", sizeof(smpte.timezone) - 1);
-                smpte.years = 0; smpte.months = 1; smpte.days = 1;
-                smpte.hours = static_cast<unsigned char>(tc.hours);
-                smpte.mins  = static_cast<unsigned char>(tc.minutes);
-                smpte.secs  = static_cast<unsigned char>(tc.seconds);
-                smpte.frame = static_cast<unsigned char>(tc.frames);
-                ltc_encoder_set_timecode(self->enc_, &smpte);
-                ltc_encoder_encode_frame(self->enc_);
+                const auto snap = self->engine_.snapshot();
+                const bool active =
+                    output_timing::activeRate(snap) > output_timing::kMinActiveRate;
+                const long long targetFrameIndex =
+                    frameIndexForSeconds(snap.playheadSeconds, cfg.fps);
 
-                self->ltcBufFill_ = ltc_encoder_get_buffer(self->enc_, self->ltcBuf_.data());
+                if (!active) {
+                    self->ltcTimelineFrameIndex_ = targetFrameIndex;
+                    self->ltcTimelineValid_ = true;
+                    self->ltcTimelineActive_ = false;
+                    self->ltcTimelineFps_ = cfg.fps;
+                } else {
+                    const long long frameError =
+                        targetFrameIndex - self->ltcTimelineFrameIndex_;
+                    const long long absFrameError =
+                        frameError < 0 ? -frameError : frameError;
+                    constexpr long long kResyncToleranceFrames = 12;
+                    const bool needsAnchor =
+                        !self->ltcTimelineValid_
+                     || self->ltcTimelineFps_ != cfg.fps
+                     || !self->ltcTimelineActive_
+                     || absFrameError > kResyncToleranceFrames;
+
+                    if (needsAnchor) {
+                        self->ltcTimelineFrameIndex_ = targetFrameIndex;
+                        self->ltcTimelineValid_ = true;
+                        self->ltcTimelineFps_ = cfg.fps;
+                    }
+                    self->ltcTimelineActive_ = true;
+                }
+
+                const TimecodeFields tc =
+                    frameIndexToFields(self->ltcTimelineFrameIndex_, cfg.fps);
+                const double speed = output_timing::ltcSpeedFromSnapshot(snap);
+                if (!encodeLtcFrame(self->enc_, tc, ltcStandardForFps(cfg.fps), speed)) {
+                    encodeLtcFrame(self->enc_, tc, ltcStandardForFps(cfg.fps), 1.0);
+                }
+
+                self->ltcBufFill_ = ltc_encoder_copy_buffer(self->enc_, self->ltcBuf_.data());
                 self->ltcBufRead_ = 0;
+
+                if (active) {
+                    if (!snap.clockMode && snap.rate < -output_timing::kMinActiveRate) {
+                        if (self->ltcTimelineFrameIndex_ > 0) {
+                            --self->ltcTimelineFrameIndex_;
+                        }
+                    } else {
+                        ++self->ltcTimelineFrameIndex_;
+                    }
+                }
             } else {
                 self->ltcBufFill_ = self->ltcBufRead_ = 0;
             }

@@ -11,8 +11,8 @@ namespace libera_timecode {
 // Snapshot returned to outputs/UI. Cheap to copy.
 struct TransportSnapshot {
     double playheadSeconds{0.0};
-    double rate{0.0};         // 0 = paused, 1 = play, ±N = scrub speed
-    bool playing{false};      // true if rate == 1.0 (set via setPlaying)
+    double rate{0.0};         // 0 = paused, playbackRate = play, ±N = scrub speed
+    bool playing{false};      // true when transport play is engaged
     bool clockMode{false};    // true if displaying / sending wall clock
 };
 
@@ -60,6 +60,13 @@ public:
     void setTapJumpSeconds(double s);
     double tapJumpSeconds() const;
 
+    // Varispeed: multiplier applied to the play() baseline rate. 1.0 is
+    // normal speed, 0.5 = half, 2.0 = double. During playback, a new rate
+    // takes effect immediately without disturbing the current playhead
+    // position. Active scrub holds keep their scrub rate until release.
+    void setPlaybackRate(double r);
+    double playbackRate() const;
+
 private:
     mutable std::mutex mutex_;
 
@@ -72,6 +79,7 @@ private:
     bool playing_{false};
     bool clockMode_{false};
     double tapJumpSeconds_{10.0};
+    double playbackRate_{1.0};
 
     struct ScrubState {
         bool held{false};

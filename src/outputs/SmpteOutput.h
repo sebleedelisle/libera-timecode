@@ -52,6 +52,10 @@ private:
     std::size_t ltcBufFill_{0};
     int frameNumberLastEncoded_{-1};
     int channelsOpen_{2};
+    bool ltcTimelineValid_{false};
+    bool ltcTimelineActive_{false};
+    long long ltcTimelineFrameIndex_{0};
+    FrameRate ltcTimelineFps_{FrameRate::fps_30_NDF};
 
     std::atomic<bool> running_{false};
     std::atomic<bool> shouldStop_{false};

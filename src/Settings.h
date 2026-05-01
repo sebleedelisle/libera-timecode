@@ -33,14 +33,18 @@ struct MidiSettings {
 struct ArtnetSettings {
     bool enabled{false};
     FrameRate fps{FrameRate::fps_30_NDF};
-    std::string targetIp{"255.255.255.255"};
+    // Comma-separated list of IPv4 addresses. macOS coalesces broadcast
+    // (255.255.255.255) on Wi-Fi at the DTIM beacon, so 127.0.0.1 is the
+    // smooth default for same-host testing. Add the broadcast/subnet-broadcast
+    // entry when you go on-network.
+    std::string targetIp{"127.0.0.1"};
     int port{6454};
 };
 
 struct SntcSettings {
     bool enabled{false};
     FrameRate fps{FrameRate::fps_30_NDF};
-    std::string targetIp{"255.255.255.255"};
+    std::string targetIp{"127.0.0.1"};
     int port{8405};
     std::string senderId{"LIBE"}; // exactly 4 ASCII characters
 };
@@ -48,6 +52,7 @@ struct SntcSettings {
 struct AppSettings {
     WindowSettings window;
     double tapJumpSeconds{10.0};
+    double playbackRate{1.0}; // varispeed multiplier; 1.0 = normal play
     SmpteSettings smpte;
     MidiSettings midi;
     ArtnetSettings artnet;

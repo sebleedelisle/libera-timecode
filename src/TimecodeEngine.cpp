@@ -80,7 +80,7 @@ void TimecodeEngine::play() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (clockMode_) return;
     playing_ = true;
-    setRateLocked(1.0);
+    setRateLocked(playbackRate_);
 }
 
 void TimecodeEngine::pause() {
@@ -115,7 +115,7 @@ void TimecodeEngine::seek(double seconds) {
     if (seconds < 0.0) seconds = 0.0;
     anchorSeconds_ = seconds;
     anchor_ = Clock::now();
-    rate_ = playing_ ? 1.0 : 0.0;
+    rate_ = playing_ ? playbackRate_ : 0.0;
 }
 
 void TimecodeEngine::nudge(double deltaSeconds) {
@@ -125,7 +125,7 @@ void TimecodeEngine::nudge(double deltaSeconds) {
     if (next < 0.0) next = 0.0;
     anchorSeconds_ = next;
     anchor_ = Clock::now();
-    rate_ = playing_ ? 1.0 : 0.0;
+    rate_ = playing_ ? playbackRate_ : 0.0;
 }
 
 void TimecodeEngine::scrubPress(ScrubDirection dir) {
@@ -153,10 +153,10 @@ void TimecodeEngine::scrubRelease(ScrubDirection dir) {
         if (next < 0.0) next = 0.0;
         anchorSeconds_ = next;
         anchor_ = Clock::now();
-        rate_ = playing_ ? 1.0 : 0.0;
+        rate_ = playing_ ? playbackRate_ : 0.0;
     } else {
         // Hold ended — return to play/pause baseline.
-        setRateLocked(playing_ ? 1.0 : 0.0);
+        setRateLocked(playing_ ? playbackRate_ : 0.0);
     }
     s.moved = false;
 }
@@ -183,7 +183,7 @@ void TimecodeEngine::scrubTick() {
     if (wantScrub) {
         if (rate_ != scrubRate) setRateLocked(scrubRate);
     } else {
-        const double baseline = playing_ ? 1.0 : 0.0;
+        const double baseline = playing_ ? playbackRate_ : 0.0;
         if (rate_ != baseline) setRateLocked(baseline);
     }
 }
@@ -226,6 +226,23 @@ void TimecodeEngine::setTapJumpSeconds(double s) {
 double TimecodeEngine::tapJumpSeconds() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return tapJumpSeconds_;
+}
+
+void TimecodeEngine::setPlaybackRate(double r) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!std::isfinite(r)) r = 1.0;
+    if (r < 0.0) r = 0.0;
+    if (r > 8.0) r = 8.0;
+    playbackRate_ = r;
+    const bool scrubbing = scrubFwd_.held || scrubBwd_.held;
+    if (playing_ && !clockMode_ && !scrubbing && rate_ != playbackRate_) {
+        setRateLocked(playbackRate_);
+    }
+}
+
+double TimecodeEngine::playbackRate() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return playbackRate_;
 }
 
 } // namespace libera_timecode

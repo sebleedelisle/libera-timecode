@@ -1,5 +1,8 @@
 #include "SntcOutput.h"
 
+#include "OutputTiming.h"
+
+#include "../ThreadQos.h"
 #include "../TimecodeEngine.h"
 
 #include <algorithm>
@@ -50,12 +53,15 @@ SntcOutput::SntcOutput(TimecodeEngine& engine) : engine_(engine) {}
 SntcOutput::~SntcOutput() { stop(); }
 
 void SntcOutput::applyConfig(const SntcSettings& config) {
+    bool socketChanged = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        socketChanged = (config.targetIp != config_.targetIp)
+                     || (config.port     != config_.port);
         config_ = config;
-        configDirty_ = true;
+        if (socketChanged) configDirty_ = true;
     }
-    cv_.notify_all();
+    if (socketChanged) cv_.notify_all();
 
     if (config.enabled && !running_.load()) {
         shouldStop_ = false;
@@ -79,12 +85,12 @@ std::string SntcOutput::status() const {
     if (!config_.enabled) return "Disabled";
     if (!lastError_.empty()) return "Error: " + lastError_;
     if (!running_.load())    return "Idle";
-    return "Sending to " + config_.targetIp + ":" + std::to_string(config_.port);
+    return "-> " + config_.targetIp + ":" + std::to_string(config_.port);
 }
 
 void SntcOutput::threadMain() {
+    setHighPriorityForOutputThread();
     using clock = std::chrono::steady_clock;
-    auto next = clock::now();
     auto lastSendTime = clock::now() - std::chrono::seconds(1);
     int lastSentFrame = -2;
 
@@ -109,19 +115,15 @@ void SntcOutput::threadMain() {
             lastSentFrame = -2;
         }
 
-        const double fps = frameRateInfo(cfg.fps).nominalFps;
-        const auto fpsInterval = std::chrono::duration_cast<clock::duration>(
-            std::chrono::duration<double>(1.0 / std::max(1.0, fps)));
-        const auto pollInterval = std::chrono::duration_cast<clock::duration>(
-            std::chrono::duration<double>(1.0 / std::max(1.0, fps * 4.0)));
+        const auto snap = engine_.snapshot();
+        const auto keepaliveInterval = output_timing::frameKeepaliveInterval(snap, cfg.fps);
 
         if (sender_.ok()) {
-            const TimecodeFields tc = secondsToFields(engine_.currentSeconds(), cfg.fps);
-            const int fn = ((tc.hours * 60 + tc.minutes) * 60 + tc.seconds)
-                           * tc.integerFps + tc.frames;
+            const TimecodeFields tc = secondsToFields(snap.playheadSeconds, cfg.fps);
+            const int fn = output_timing::labelFrameNumber(tc);
             const auto now = clock::now();
             const bool frameChanged = (fn != lastSentFrame);
-            const bool keepalive = (now - lastSendTime >= fpsInterval);
+            const bool keepalive = (now - lastSendTime > keepaliveInterval);
             if (frameChanged || keepalive) {
                 const int rateByte = std::clamp(frameRateInfo(cfg.fps).integerFps, 1, 240);
                 uint8_t pkt[16];
@@ -138,9 +140,7 @@ void SntcOutput::threadMain() {
             }
         }
 
-        next += pollInterval;
-        const auto now = clock::now();
-        if (next < now) next = now + pollInterval;
+        const auto next = clock::now() + output_timing::nextFrameBoundaryDelay(snap, cfg.fps);
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait_until(lock, next, [this] {
             return shouldStop_.load() || configDirty_.load();

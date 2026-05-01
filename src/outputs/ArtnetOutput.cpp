@@ -1,5 +1,8 @@
 #include "ArtnetOutput.h"
 
+#include "OutputTiming.h"
+
+#include "../ThreadQos.h"
 #include "../TimecodeEngine.h"
 
 #include <chrono>
@@ -10,7 +13,10 @@ namespace libera_timecode {
 namespace {
 
 uint8_t artnetTypeForFps(FrameRate r) {
-    // 0 Film(24), 1 EBU(25), 2 DF(29.97), 3 SMPTE(30 NDF)
+    // Art-Net spec only defines four codes:
+    //   0 Film (24fps)   1 EBU (25fps)   2 DF (29.97 DF)   3 SMPTE (30 NDF)
+    // 23.976 maps to Film; 29.97 NDF and 30 DF have no exact code, so we
+    // pick the closest match (NDF flavors → SMPTE 30, DF flavors → DF 29.97).
     switch (r) {
     case FrameRate::fps_23_976:
     case FrameRate::fps_24:        return 0;
@@ -30,12 +36,18 @@ ArtnetOutput::ArtnetOutput(TimecodeEngine& engine) : engine_(engine) {}
 ArtnetOutput::~ArtnetOutput() { stop(); }
 
 void ArtnetOutput::applyConfig(const ArtnetSettings& config) {
+    // Only mark the socket dirty when fields that affect socket setup change.
+    // Frame-rate / fps changes are picked up live on the next poll tick
+    // without any teardown.
+    bool socketChanged = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        socketChanged = (config.targetIp != config_.targetIp)
+                     || (config.port     != config_.port);
         config_ = config;
-        configDirty_ = true;
+        if (socketChanged) configDirty_ = true;
     }
-    cv_.notify_all();
+    if (socketChanged) cv_.notify_all();
 
     if (config.enabled && !running_.load()) {
         shouldStop_ = false;
@@ -59,12 +71,12 @@ std::string ArtnetOutput::status() const {
     if (!config_.enabled) return "Disabled";
     if (!lastError_.empty())  return "Error: " + lastError_;
     if (!running_.load())     return "Idle";
-    return "Sending to " + config_.targetIp + ":" + std::to_string(config_.port);
+    return "-> " + config_.targetIp + ":" + std::to_string(config_.port);
 }
 
 void ArtnetOutput::threadMain() {
+    setHighPriorityForOutputThread();
     using clock = std::chrono::steady_clock;
-    auto next = clock::now();
     auto lastSendTime = clock::now() - std::chrono::seconds(1);
     int lastSentFrame = -2;
 
@@ -89,21 +101,15 @@ void ArtnetOutput::threadMain() {
             lastSentFrame = -2;
         }
 
-        const double fps = frameRateInfo(cfg.fps).nominalFps;
-        const auto fpsInterval = std::chrono::duration_cast<clock::duration>(
-            std::chrono::duration<double>(1.0 / std::max(1.0, fps)));
-        const auto pollInterval = std::chrono::duration_cast<clock::duration>(
-            std::chrono::duration<double>(1.0 / std::max(1.0, fps * 4.0)));
+        const auto snap = engine_.snapshot();
+        const auto keepaliveInterval = output_timing::frameKeepaliveInterval(snap, cfg.fps);
 
-        // Send when the frame number advances, or once per frame interval to
-        // keep the receiver alive while paused.
         if (sender_.ok()) {
-            const TimecodeFields tc = secondsToFields(engine_.currentSeconds(), cfg.fps);
-            const int fn = ((tc.hours * 60 + tc.minutes) * 60 + tc.seconds)
-                           * tc.integerFps + tc.frames;
+            const TimecodeFields tc = secondsToFields(snap.playheadSeconds, cfg.fps);
+            const int fn = output_timing::labelFrameNumber(tc);
             const auto now = clock::now();
             const bool frameChanged = (fn != lastSentFrame);
-            const bool keepalive = (now - lastSendTime >= fpsInterval);
+            const bool keepalive = (now - lastSendTime > keepaliveInterval);
             if (frameChanged || keepalive) {
                 uint8_t pkt[19];
                 std::memcpy(pkt, "Art-Net\0", 8);
@@ -128,9 +134,7 @@ void ArtnetOutput::threadMain() {
             }
         }
 
-        next += pollInterval;
-        const auto now = clock::now();
-        if (next < now) next = now + pollInterval;
+        const auto next = clock::now() + output_timing::nextFrameBoundaryDelay(snap, cfg.fps);
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait_until(lock, next, [this] {
             return shouldStop_.load() || configDirty_.load();

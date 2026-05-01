@@ -109,8 +109,11 @@ add_executable(libera_timecode
     src/LiberaApp.cpp
     src/Paths.cpp
     src/Settings.cpp
+    src/ThreadQos.cpp
     src/Timecode.cpp
     src/TimecodeEngine.cpp
+    $<$<PLATFORM_ID:Darwin>:${CMAKE_CURRENT_SOURCE_DIR}/src/AppActivity_macos.mm>
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:${CMAKE_CURRENT_SOURCE_DIR}/src/AppActivity_other.cpp>
     src/outputs/UdpSender.cpp
     src/outputs/ArtnetOutput.cpp
     src/outputs/SntcOutput.cpp
@@ -144,6 +147,18 @@ else()
 endif()
 
 if(APPLE)
+    set(LIBERA_TIMECODE_MACOS_BUNDLE_ICON
+        "${CMAKE_CURRENT_SOURCE_DIR}/icons/libera-timecode.icns")
+    set_source_files_properties("${LIBERA_TIMECODE_MACOS_BUNDLE_ICON}" PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources"
+    )
+    target_sources(libera_timecode PRIVATE "${LIBERA_TIMECODE_MACOS_BUNDLE_ICON}")
+elseif(WIN32)
+    target_sources(libera_timecode PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/icons/libera-timecode.rc")
+endif()
+
+if(APPLE)
     set_target_properties(libera_timecode PROPERTIES
         MACOSX_BUNDLE TRUE
         OUTPUT_NAME "${LIBERA_TIMECODE_APP_BUNDLE_NAME}"
@@ -151,6 +166,7 @@ if(APPLE)
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.sebleedelisle.libera-timecode"
         MACOSX_BUNDLE_BUNDLE_VERSION "${LIBERA_TIMECODE_APP_VERSION}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${LIBERA_TIMECODE_APP_VERSION}"
+        MACOSX_BUNDLE_ICON_FILE "libera-timecode.icns"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
     )
 endif()

@@ -109,6 +109,7 @@ void loadSettings(AppSettings& out) {
         out.window.h = getOr(*it, "h", out.window.h);
     }
     out.tapJumpSeconds = getOr(j, "tap_jump_seconds", out.tapJumpSeconds);
+    out.playbackRate   = getOr(j, "playback_rate",    out.playbackRate);
     if (auto it = j.find("smpte");  it != j.end()) readSmpte(*it,  out.smpte);
     if (auto it = j.find("midi");   it != j.end()) readMidi(*it,   out.midi);
     if (auto it = j.find("artnet"); it != j.end()) readArtnet(*it, out.artnet);
@@ -124,6 +125,7 @@ void saveSettings(const AppSettings& in) {
         {"h", in.window.h},
     };
     j["tap_jump_seconds"] = in.tapJumpSeconds;
+    j["playback_rate"]    = in.playbackRate;
     j["smpte"]  = writeSmpte(in.smpte);
     j["midi"]   = writeMidi(in.midi);
     j["artnet"] = writeArtnet(in.artnet);

@@ -1,3 +1,4 @@
+#include "AppActivity.h"
 #include "LiberaApp.h"
 #include "Paths.hpp"
 #include "Settings.h"
@@ -248,17 +249,18 @@ void drawArtnetSettings(ArtnetSettings& s, bool& dirty) {
         if (s.fps != prev) dirty = true;
     }
 
-    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SetNextItemWidth(300.0f);
     {
         std::string before = s.targetIp;
-        inputText("Target IP", s.targetIp);
+        inputText("Targets", s.targetIp);
         if (s.targetIp != before) dirty = true;
     }
     ImGui::SetNextItemWidth(120.0f);
     if (ImGui::InputInt("Port", &s.port, 0, 0)) dirty = true;
     if (s.port < 1)     s.port = 1;
     if (s.port > 65535) s.port = 65535;
-    ImGui::TextDisabled("Default 6454, broadcast 255.255.255.255 reaches all nodes.");
+    ImGui::TextDisabled("Comma-separated. e.g. 127.0.0.1, 192.168.1.255");
+    ImGui::TextDisabled("(macOS Wi-Fi delays 255.255.255.255 by ~300ms — prefer subnet/unicast.)");
 }
 
 void drawSntcSettings(SntcSettings& s, bool& dirty) {
@@ -272,16 +274,17 @@ void drawSntcSettings(SntcSettings& s, bool& dirty) {
         if (s.fps != prev) dirty = true;
     }
 
-    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SetNextItemWidth(300.0f);
     {
         std::string before = s.targetIp;
-        inputText("Target IP", s.targetIp);
+        inputText("Targets", s.targetIp);
         if (s.targetIp != before) dirty = true;
     }
     ImGui::SetNextItemWidth(120.0f);
     if (ImGui::InputInt("Port", &s.port, 0, 0)) dirty = true;
     if (s.port < 1)     s.port = 1;
     if (s.port > 65535) s.port = 65535;
+    ImGui::TextDisabled("Comma-separated, e.g. 127.0.0.1, 192.168.1.42");
 
     char idBuf[5] = {' ', ' ', ' ', ' ', 0};
     for (size_t i = 0; i < 4 && i < s.senderId.size(); ++i) idBuf[i] = s.senderId[i];
@@ -295,6 +298,8 @@ void drawSntcSettings(SntcSettings& s, bool& dirty) {
 } // namespace
 
 int main() {
+    libera_timecode::disableAppNap();
+
     AppSettings settings;
     loadSettings(settings);
 
@@ -309,6 +314,7 @@ int main() {
 
     TimecodeEngine engine;
     engine.setTapJumpSeconds(settings.tapJumpSeconds);
+    engine.setPlaybackRate(settings.playbackRate);
 
     SmpteOutput  smpte (engine);
     MidiOutput   midi  (engine);
@@ -321,6 +327,8 @@ int main() {
     sntc.applyConfig(settings.sntc);
 
     bool settingsDirty = false;
+    bool savePending = false;
+    auto lastSettingsChange = std::chrono::steady_clock::now();
 
     OpenSettings open;
 
@@ -489,6 +497,37 @@ int main() {
             engine.setClockMode(!clockMode);
         }
 
+        // ---------- Varispeed ----------
+        ImGui::Spacing();
+        {
+            const float controlWidth = 240.0f;
+            const float buttonWidth = 60.0f;
+            const float total = controlWidth + 8.0f + buttonWidth + 8.0f + 60.0f;
+            const float startX = (ImGui::GetContentRegionAvail().x - total) * 0.5f;
+            if (startX > 0) {
+                ImGui::Dummy(ImVec2(startX, 1));
+                ImGui::SameLine();
+            }
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Speed");
+            ImGui::SameLine();
+            // Display as percent offset from nominal: +/-5%, two decimals.
+            float offsetPct = static_cast<float>((settings.playbackRate - 1.0) * 100.0);
+            ImGui::SetNextItemWidth(controlWidth);
+            if (ImGui::SliderFloat("##speed", &offsetPct, -5.0f, 5.0f, "%+.2f%%",
+                                    ImGuiSliderFlags_AlwaysClamp)) {
+                settings.playbackRate = 1.0 + static_cast<double>(offsetPct) / 100.0;
+                engine.setPlaybackRate(settings.playbackRate);
+                settingsDirty = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("0%", ImVec2(buttonWidth, 0))) {
+                settings.playbackRate = 1.0;
+                engine.setPlaybackRate(1.0);
+                settingsDirty = true;
+            }
+        }
+
         // Help line
         ImGui::Spacing();
         ImGui::TextDisabled("Tap rewind/FF to jump %.0fs. Hold to scrub (ramps to 8x). Clock icon: send wall time.",
@@ -513,13 +552,17 @@ int main() {
         runPopup("Depence", open.sntc,    [&] { drawSntcSettings  (settings.sntc,   settingsDirty); });
 
         // ---------- Persist & live-restart on changes ----------
+        // applyConfig is idempotent — calls are cheap when nothing material
+        // changed — but file I/O is debounced so dragging a slider doesn't
+        // hit disk every frame.
         if (settingsDirty) {
             smpte.applyConfig(settings.smpte);
             midi.applyConfig(settings.midi);
             artnet.applyConfig(settings.artnet);
             sntc.applyConfig(settings.sntc);
-            saveSettings(settings);
             settingsDirty = false;
+            savePending = true;
+            lastSettingsChange = std::chrono::steady_clock::now();
         }
 
         // Persist window geometry when it changes.
@@ -529,7 +572,16 @@ int main() {
             ww != settings.window.w || wh != settings.window.h) {
             settings.window.x = wx; settings.window.y = wy;
             settings.window.w = ww; settings.window.h = wh;
-            saveSettings(settings);
+            savePending = true;
+            lastSettingsChange = std::chrono::steady_clock::now();
+        }
+
+        if (savePending) {
+            const auto sinceChange = std::chrono::steady_clock::now() - lastSettingsChange;
+            if (sinceChange > std::chrono::milliseconds(250)) {
+                saveSettings(settings);
+                savePending = false;
+            }
         }
 
         app.endFrame();

@@ -41,6 +41,10 @@ struct TimecodeFields {
 // Negative input is treated as 0.
 TimecodeFields secondsToFields(double seconds, FrameRate rate);
 
+// Convert an elapsed frame index to HH:MM:SS:FF for the given frame rate.
+// Negative input is treated as 0.
+TimecodeFields frameIndexToFields(long long frameNumber, FrameRate rate);
+
 // Format a TimecodeFields as "HH:MM:SS:FF" (drop-frame uses ';' separator
 // before the frames field per SMPTE convention if useDfPunctuation is true).
 std::string formatFields(const TimecodeFields& fields, bool useDfPunctuation = false);

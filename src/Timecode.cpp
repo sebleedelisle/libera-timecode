@@ -44,16 +44,24 @@ TimecodeFields secondsToFields(double seconds, FrameRate rate) {
     if (seconds < 0.0 || !std::isfinite(seconds)) seconds = 0.0;
     const auto& info = frameRateInfo(rate);
 
+    const long long frameNumber =
+        static_cast<long long>(std::floor(seconds * info.nominalFps + 1e-9));
+    return frameIndexToFields(frameNumber, rate);
+}
+
+TimecodeFields frameIndexToFields(long long frameNumber, FrameRate rate) {
+    if (frameNumber < 0) frameNumber = 0;
+    const auto& info = frameRateInfo(rate);
+
     TimecodeFields out;
     out.dropFrame = info.dropFrame;
     out.integerFps = info.integerFps;
 
     if (!info.dropFrame) {
         // Plain breakdown using nominal fps.
-        const long long totalFrames = static_cast<long long>(std::floor(seconds * info.nominalFps + 1e-9));
         const long long fps = info.integerFps;
-        out.frames  = static_cast<int>(totalFrames % fps);
-        const long long ts = totalFrames / fps;
+        out.frames  = static_cast<int>(frameNumber % fps);
+        const long long ts = frameNumber / fps;
         out.seconds = static_cast<int>(ts % 60);
         out.minutes = static_cast<int>((ts / 60) % 60);
         out.hours   = static_cast<int>((ts / 3600) % 24);
@@ -67,9 +75,6 @@ TimecodeFields secondsToFields(double seconds, FrameRate rate) {
     const int dropPerMinute = (fps == 30) ? 2 : 4;   // 4 for 60 DF if ever needed
     const long long framesPerMin = (long long)fps * 60 - dropPerMinute;
     const long long framesPer10Min = (long long)fps * 60 * 10 - dropPerMinute * 9;
-
-    // Wall-clock frame index using nominal (real) rate.
-    long long frameNumber = static_cast<long long>(std::floor(seconds * info.nominalFps + 1e-9));
 
     const long long d = frameNumber / framesPer10Min;
     const long long m = frameNumber % framesPer10Min;
