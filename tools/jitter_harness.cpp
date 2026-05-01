@@ -1,14 +1,20 @@
 #include "Settings.h"
+#include "ThreadQos.h"
 #include "Timecode.h"
 #include "TimecodeEngine.h"
 #include "outputs/ArtnetOutput.h"
+#include "outputs/LtcProtocol.h"
 #include "outputs/MidiOutput.h"
 #include "outputs/OutputTiming.h"
 #include "outputs/SmpteOutput.h"
 #include "outputs/SntcOutput.h"
+#include "outputs/TimecodeProtocol.h"
 #include "outputs/UdpSender.h"
 
+#include <ltc.h>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -41,6 +47,11 @@ using socket_t = SOCKET;
 #include <unistd.h>
 using socket_t = int;
 #define CLOSE_SOCKET ::close
+#ifdef __APPLE__
+#include <pthread.h>
+#else
+#include <sys/resource.h>
+#endif
 #endif
 
 namespace {
@@ -57,6 +68,8 @@ struct Options {
     int cpuWorkers{0};
     double networkMbps{0.0};
     std::string reportPath{"jitter-report.csv"};
+    std::string outlierPath{"jitter-outliers.csv"};
+    double outlierJitterMs{1.0};
     bool enableSmpte{true};
     bool enableMidi{true};
     bool enableArtnet{true};
@@ -65,6 +78,30 @@ struct Options {
     double maxP99JitterMs{std::numeric_limits<double>::infinity()};
     double maxJitterMs{std::numeric_limits<double>::infinity()};
     bool failOnDuplicates{false};
+};
+
+void setBackgroundPriorityForLoadThread() {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+#elif defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
+    setpriority(PRIO_PROCESS, 0, 5);
+#endif
+}
+
+struct OutlierEvent {
+    std::string protocol;
+    double rate{1.0};
+    double phaseElapsedMs{0.0};
+    double expectedIntervalMs{0.0};
+    double intervalMs{0.0};
+    double absJitterMs{0.0};
+    int previousFrame{-1};
+    int currentFrame{-1};
+    int frameStep{0};
+    std::string previousTimecode;
+    std::string currentTimecode;
 };
 
 struct PhaseStats {
@@ -78,6 +115,7 @@ struct PhaseStats {
     uint64_t parseErrors{0};
     std::vector<double> intervalsMs;
     std::vector<double> absJitterMs;
+    std::vector<OutlierEvent> outliers;
 };
 
 std::string lowerNoSpace(std::string s) {
@@ -124,6 +162,8 @@ void printUsage(const char* argv0) {
         << "  --cpu-workers N          busy CPU worker threads (default 0)\n"
         << "  --network-mbps N         loopback UDP load in Mbps (default 0)\n"
         << "  --report PATH            CSV report path (default jitter-report.csv)\n"
+        << "  --outliers PATH          outlier CSV path (default jitter-outliers.csv)\n"
+        << "  --outlier-ms N           log intervals with abs jitter >= N ms (default 1)\n"
         << "  --artnet-port PORT       loopback Art-Net port (default 16454)\n"
         << "  --sntc-port PORT         loopback SNTC port (default 18405)\n"
         << "  --max-mean-jitter-ms N   fail if mean absolute jitter exceeds N\n"
@@ -162,6 +202,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             if (const char* v = needValue("--network-mbps")) opt.networkMbps = std::stod(v);
         } else if (arg == "--report") {
             if (const char* v = needValue("--report")) opt.reportPath = v;
+        } else if (arg == "--outliers") {
+            if (const char* v = needValue("--outliers")) opt.outlierPath = v;
+        } else if (arg == "--outlier-ms") {
+            if (const char* v = needValue("--outlier-ms")) opt.outlierJitterMs = std::stod(v);
         } else if (arg == "--artnet-port") {
             if (const char* v = needValue("--artnet-port")) opt.artnetPort = std::stoi(v);
         } else if (arg == "--sntc-port") {
@@ -243,12 +287,28 @@ ParsedPacket parseSntc(const uint8_t* data, std::size_t len, FrameRate fps) {
     return p;
 }
 
+TimecodeFields emptyFieldsFor(FrameRate fps) {
+    TimecodeFields tc;
+    const auto& info = frameRateInfo(fps);
+    tc.dropFrame = info.dropFrame;
+    tc.integerFps = info.integerFps;
+    return tc;
+}
+
 class UdpRecorder {
 public:
     using Parser = ParsedPacket (*)(const uint8_t*, std::size_t, FrameRate);
 
-    UdpRecorder(std::string protocol, int port, FrameRate fps, Parser parser)
-        : protocol_(std::move(protocol)), port_(port), fps_(fps), parser_(parser) {}
+    UdpRecorder(std::string protocol,
+                int port,
+                FrameRate fps,
+                Parser parser,
+                double outlierJitterMs)
+        : protocol_(std::move(protocol)),
+          port_(port),
+          fps_(fps),
+          parser_(parser),
+          outlierJitterMs_(outlierJitterMs) {}
 
     bool start(std::string& error) {
         socket_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -292,8 +352,11 @@ public:
         stats_.rate = rate;
         stats_.expectedIntervalMs = expectedIntervalSeconds * 1000.0;
         lastFrame_ = -1;
+        lastTc_ = {};
         lastFrameTime_ = {};
+        phaseStartTime_ = {};
         haveLastFrame_ = false;
+        warmupIntervalsRemaining_ = 1;
         recording_ = true;
     }
 
@@ -305,6 +368,7 @@ public:
 
 private:
     void run() {
+        setHighPriorityForOutputThread();
         std::array<uint8_t, 2048> buf{};
         while (!stop_.load()) {
             fd_set fds;
@@ -356,12 +420,37 @@ private:
         if (haveLastFrame_) {
             const double intervalMs =
                 std::chrono::duration<double, std::milli>(now - lastFrameTime_).count();
-            stats_.intervalsMs.push_back(intervalMs);
-            stats_.absJitterMs.push_back(std::fabs(intervalMs - stats_.expectedIntervalMs));
+            const double absJitterMs = std::fabs(intervalMs - stats_.expectedIntervalMs);
+            if (warmupIntervalsRemaining_ > 0) {
+                --warmupIntervalsRemaining_;
+            } else {
+                stats_.intervalsMs.push_back(intervalMs);
+                stats_.absJitterMs.push_back(absJitterMs);
+
+                if (absJitterMs >= outlierJitterMs_) {
+                    OutlierEvent event;
+                    event.protocol = protocol_;
+                    event.rate = stats_.rate;
+                    event.phaseElapsedMs =
+                        std::chrono::duration<double, std::milli>(now - phaseStartTime_).count();
+                    event.expectedIntervalMs = stats_.expectedIntervalMs;
+                    event.intervalMs = intervalMs;
+                    event.absJitterMs = absJitterMs;
+                    event.previousFrame = lastFrame_;
+                    event.currentFrame = frame;
+                    event.frameStep = frame - lastFrame_;
+                    event.previousTimecode = formatFields(lastTc_, true);
+                    event.currentTimecode = formatFields(parsed.tc, true);
+                    stats_.outliers.push_back(std::move(event));
+                }
+            }
+        } else {
+            phaseStartTime_ = now;
         }
 
         haveLastFrame_ = true;
         lastFrame_ = frame;
+        lastTc_ = parsed.tc;
         lastFrameTime_ = now;
     }
 
@@ -369,6 +458,7 @@ private:
     int port_;
     FrameRate fps_;
     Parser parser_;
+    double outlierJitterMs_{1.0};
     socket_t socket_{-1};
     std::atomic<bool> stop_{false};
     std::thread thread_;
@@ -377,11 +467,323 @@ private:
     bool recording_{false};
     PhaseStats stats_;
     int lastFrame_{-1};
+    TimecodeFields lastTc_{};
     Clock::time_point lastFrameTime_{};
+    Clock::time_point phaseStartTime_{};
     bool haveLastFrame_{false};
+    int warmupIntervalsRemaining_{1};
+};
+
+class MidiRecorder {
+public:
+    MidiRecorder(FrameRate fps, double outlierJitterMs)
+        : fps_(fps), outlierJitterMs_(outlierJitterMs) {}
+
+    void begin(double rate, double expectedIntervalSeconds) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_ = PhaseStats{};
+        stats_.protocol = "midi-mtc-qf";
+        stats_.rate = rate;
+        stats_.expectedIntervalMs = expectedIntervalSeconds * 1000.0;
+        qfNibbles_.fill(0);
+        decodedTc_ = emptyFieldsFor(fps_);
+        lastTc_ = emptyFieldsFor(fps_);
+        lastPiece_ = -1;
+        lastDecodedFrame_ = -1;
+        lastEventTime_ = {};
+        phaseStartTime_ = {};
+        haveLastPiece_ = false;
+        haveDecodedTc_ = false;
+        haveLastDecodedFrame_ = false;
+        warmupIntervalsRemaining_ = 1;
+        recording_ = true;
+    }
+
+    PhaseStats end() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        recording_ = false;
+        return stats_;
+    }
+
+    void observe(const unsigned char* data,
+                 std::size_t size,
+                 Clock::time_point sentAt) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!recording_) return;
+
+        ++stats_.packets;
+        if (isFullFrame(data, size)) {
+            decodeFullFrame(data);
+            return;
+        }
+
+        if (size != 2 || data[0] != 0xF1) {
+            ++stats_.parseErrors;
+            return;
+        }
+
+        const int piece = (data[1] >> 4) & 0x07;
+        const int value = data[1] & 0x0F;
+        qfNibbles_[static_cast<std::size_t>(piece)] = value;
+        if (piece == 7) {
+            decodeQuarterFrameSet();
+        }
+
+        if (haveLastPiece_) {
+            const int expectedPiece = (lastPiece_ + 1) & 0x07;
+            if (piece == lastPiece_) {
+                ++stats_.duplicates;
+                return;
+            }
+            if (piece != expectedPiece) {
+                ++stats_.parseErrors;
+            }
+        }
+
+        ++stats_.frameChanges;
+        const TimecodeFields currentTc = haveDecodedTc_ ? decodedTc_ : emptyFieldsFor(fps_);
+        if (haveLastPiece_) {
+            const double intervalMs =
+                std::chrono::duration<double, std::milli>(sentAt - lastEventTime_).count();
+            const double absJitterMs = std::fabs(intervalMs - stats_.expectedIntervalMs);
+            if (warmupIntervalsRemaining_ > 0) {
+                --warmupIntervalsRemaining_;
+            } else {
+                stats_.intervalsMs.push_back(intervalMs);
+                stats_.absJitterMs.push_back(absJitterMs);
+
+                if (absJitterMs >= outlierJitterMs_) {
+                    OutlierEvent event;
+                    event.protocol = stats_.protocol;
+                    event.rate = stats_.rate;
+                    event.phaseElapsedMs =
+                        std::chrono::duration<double, std::milli>(sentAt - phaseStartTime_).count();
+                    event.expectedIntervalMs = stats_.expectedIntervalMs;
+                    event.intervalMs = intervalMs;
+                    event.absJitterMs = absJitterMs;
+                    event.previousFrame = lastPiece_;
+                    event.currentFrame = piece;
+                    event.frameStep = (piece - lastPiece_ + 8) & 0x07;
+                    event.previousTimecode = formatFields(lastTc_, true);
+                    event.currentTimecode = formatFields(currentTc, true);
+                    stats_.outliers.push_back(std::move(event));
+                }
+            }
+        } else {
+            phaseStartTime_ = sentAt;
+        }
+
+        lastPiece_ = piece;
+        lastTc_ = currentTc;
+        lastEventTime_ = sentAt;
+        haveLastPiece_ = true;
+    }
+
+private:
+    static bool isFullFrame(const unsigned char* data, std::size_t size) {
+        return size == 10
+            && data[0] == 0xF0
+            && data[1] == 0x7F
+            && data[3] == 0x01
+            && data[4] == 0x01
+            && data[9] == 0xF7;
+    }
+
+    void decodeFullFrame(const unsigned char* data) {
+        decodedTc_ = emptyFieldsFor(fps_);
+        decodedTc_.hours = data[5] & 0x1F;
+        decodedTc_.minutes = data[6] & 0x3F;
+        decodedTc_.seconds = data[7] & 0x3F;
+        decodedTc_.frames = data[8] & 0x1F;
+        haveDecodedTc_ = true;
+    }
+
+    void decodeQuarterFrameSet() {
+        const int rateCode = (qfNibbles_[7] >> 1) & 0x03;
+        if (rateCode != timecode_protocol::mtcRateCode(fps_)) {
+            ++stats_.parseErrors;
+        }
+
+        decodedTc_ = emptyFieldsFor(fps_);
+        decodedTc_.frames = qfNibbles_[0] | ((qfNibbles_[1] & 0x01) << 4);
+        decodedTc_.seconds = qfNibbles_[2] | ((qfNibbles_[3] & 0x03) << 4);
+        decodedTc_.minutes = qfNibbles_[4] | ((qfNibbles_[5] & 0x03) << 4);
+        decodedTc_.hours = qfNibbles_[6] | ((qfNibbles_[7] & 0x01) << 4);
+        haveDecodedTc_ = true;
+
+        const int decodedFrame = output_timing::labelFrameNumber(decodedTc_);
+        if (haveLastDecodedFrame_ && decodedFrame < lastDecodedFrame_) {
+            ++stats_.backwards;
+        }
+        lastDecodedFrame_ = decodedFrame;
+        haveLastDecodedFrame_ = true;
+    }
+
+    FrameRate fps_;
+    double outlierJitterMs_{1.0};
+    std::mutex mutex_;
+    bool recording_{false};
+    PhaseStats stats_;
+    std::array<int, 8> qfNibbles_{};
+    TimecodeFields decodedTc_{};
+    TimecodeFields lastTc_{};
+    int lastPiece_{-1};
+    int lastDecodedFrame_{-1};
+    Clock::time_point lastEventTime_{};
+    Clock::time_point phaseStartTime_{};
+    bool haveLastPiece_{false};
+    bool haveDecodedTc_{false};
+    bool haveLastDecodedFrame_{false};
+    int warmupIntervalsRemaining_{1};
+};
+
+class LtcRecorder {
+public:
+    LtcRecorder(FrameRate fps, int sampleRate, double outlierJitterMs)
+        : fps_(fps), sampleRate_(sampleRate), outlierJitterMs_(outlierJitterMs) {}
+
+    ~LtcRecorder() {
+        if (decoder_) ltc_decoder_free(decoder_);
+    }
+
+    void begin(double rate, double expectedIntervalSeconds) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (decoder_) {
+            ltc_decoder_free(decoder_);
+            decoder_ = nullptr;
+        }
+        const int apv = std::max(1, static_cast<int>(
+            std::lround(static_cast<double>(sampleRate_)
+                        / ltc_protocol::effectiveFps(fps_))));
+        decoder_ = ltc_decoder_create(apv, 64);
+
+        stats_ = PhaseStats{};
+        stats_.protocol = "smpte-ltc";
+        stats_.rate = rate;
+        stats_.expectedIntervalMs = expectedIntervalSeconds * 1000.0;
+        lastTc_ = emptyFieldsFor(fps_);
+        lastFrame_ = -1;
+        lastFrameStartSample_ = 0;
+        phaseStartSample_ = 0;
+        haveLastFrame_ = false;
+        warmupIntervalsRemaining_ = 1;
+        recording_ = true;
+
+        if (!decoder_) {
+            ++stats_.parseErrors;
+        }
+    }
+
+    PhaseStats end() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        recording_ = false;
+        return stats_;
+    }
+
+    void observe(const unsigned char* samples,
+                 std::size_t count,
+                 std::uint64_t firstSample) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!recording_) return;
+
+        ++stats_.packets;
+        if (!decoder_) {
+            ++stats_.parseErrors;
+            return;
+        }
+
+        ltc_decoder_write(decoder_,
+                          const_cast<unsigned char*>(samples),
+                          count,
+                          static_cast<ltc_off_t>(firstSample));
+
+        LTCFrameExt ext;
+        while (ltc_decoder_read(decoder_, &ext)) {
+            observeDecodedFrame(ext);
+        }
+    }
+
+private:
+    void observeDecodedFrame(const LTCFrameExt& ext) {
+        if (ext.reverse) {
+            ++stats_.parseErrors;
+        }
+
+        SMPTETimecode decoded;
+        ltc_frame_to_time(&decoded, const_cast<LTCFrame*>(&ext.ltc), 0);
+
+        TimecodeFields tc = emptyFieldsFor(fps_);
+        tc.hours = decoded.hours;
+        tc.minutes = decoded.mins;
+        tc.seconds = decoded.secs;
+        tc.frames = decoded.frame;
+
+        const int frame = output_timing::labelFrameNumber(tc);
+        if (haveLastFrame_ && frame == lastFrame_) {
+            ++stats_.duplicates;
+            return;
+        }
+        if (haveLastFrame_ && frame < lastFrame_) {
+            ++stats_.backwards;
+        }
+
+        ++stats_.frameChanges;
+        if (haveLastFrame_) {
+            const double intervalMs =
+                static_cast<double>(ext.off_start - lastFrameStartSample_)
+                * 1000.0 / static_cast<double>(sampleRate_);
+            const double absJitterMs = std::fabs(intervalMs - stats_.expectedIntervalMs);
+            if (warmupIntervalsRemaining_ > 0) {
+                --warmupIntervalsRemaining_;
+            } else {
+                stats_.intervalsMs.push_back(intervalMs);
+                stats_.absJitterMs.push_back(absJitterMs);
+
+                if (absJitterMs >= outlierJitterMs_) {
+                    OutlierEvent event;
+                    event.protocol = stats_.protocol;
+                    event.rate = stats_.rate;
+                    event.phaseElapsedMs =
+                        static_cast<double>(ext.off_start - phaseStartSample_)
+                        * 1000.0 / static_cast<double>(sampleRate_);
+                    event.expectedIntervalMs = stats_.expectedIntervalMs;
+                    event.intervalMs = intervalMs;
+                    event.absJitterMs = absJitterMs;
+                    event.previousFrame = lastFrame_;
+                    event.currentFrame = frame;
+                    event.frameStep = frame - lastFrame_;
+                    event.previousTimecode = formatFields(lastTc_, true);
+                    event.currentTimecode = formatFields(tc, true);
+                    stats_.outliers.push_back(std::move(event));
+                }
+            }
+        } else {
+            phaseStartSample_ = ext.off_start;
+        }
+
+        haveLastFrame_ = true;
+        lastFrame_ = frame;
+        lastTc_ = tc;
+        lastFrameStartSample_ = ext.off_start;
+    }
+
+    FrameRate fps_;
+    int sampleRate_{48000};
+    double outlierJitterMs_{1.0};
+    std::mutex mutex_;
+    bool recording_{false};
+    LTCDecoder* decoder_{nullptr};
+    PhaseStats stats_;
+    TimecodeFields lastTc_{};
+    int lastFrame_{-1};
+    ltc_off_t lastFrameStartSample_{0};
+    ltc_off_t phaseStartSample_{0};
+    bool haveLastFrame_{false};
+    int warmupIntervalsRemaining_{1};
 };
 
 void cpuWorker(std::atomic<bool>& stop) {
+    setBackgroundPriorityForLoadThread();
     volatile double x = 0.0;
     while (!stop.load(std::memory_order_relaxed)) {
         for (int i = 1; i < 5000; ++i) {
@@ -391,6 +793,7 @@ void cpuWorker(std::atomic<bool>& stop) {
 }
 
 void networkLoadWorker(std::atomic<bool>& stop, double mbps) {
+    setBackgroundPriorityForLoadThread();
     UdpSender sender;
     std::string err;
     if (!sender.configure("127.0.0.1", 19191, err)) {
@@ -454,6 +857,28 @@ void writeReport(const std::string& path, const std::vector<PhaseStats>& rows) {
     }
 }
 
+void writeOutliers(const std::string& path, const std::vector<PhaseStats>& rows) {
+    std::ofstream out(path, std::ios::trunc);
+    out << "protocol,rate,phase_elapsed_ms,expected_ms,interval_ms,abs_jitter_ms,"
+           "previous_frame,current_frame,frame_step,previous_timecode,current_timecode\n";
+    out << std::fixed << std::setprecision(6);
+    for (const auto& s : rows) {
+        for (const auto& event : s.outliers) {
+            out << event.protocol << ','
+                << event.rate << ','
+                << event.phaseElapsedMs << ','
+                << event.expectedIntervalMs << ','
+                << event.intervalMs << ','
+                << event.absJitterMs << ','
+                << event.previousFrame << ','
+                << event.currentFrame << ','
+                << event.frameStep << ','
+                << event.previousTimecode << ','
+                << event.currentTimecode << '\n';
+        }
+    }
+}
+
 void printSummary(const std::vector<PhaseStats>& rows) {
     std::cout << std::fixed << std::setprecision(3);
     for (const auto& s : rows) {
@@ -464,6 +889,7 @@ void printSummary(const std::vector<PhaseStats>& rows) {
                   << " dup=" << s.duplicates
                   << " backwards=" << s.backwards
                   << " parse_errors=" << s.parseErrors
+                  << " outliers=" << s.outliers.size()
                   << " mean_jitter_ms=" << mean(s.absJitterMs)
                   << " p99_jitter_ms=" << percentile(s.absJitterMs, 0.99)
                   << " max_jitter_ms=" << maxOrZero(s.absJitterMs)
@@ -520,8 +946,8 @@ int main(int argc, char** argv) {
     }
 
     std::string err;
-    UdpRecorder artnetRec("artnet", opt.artnetPort, opt.fps, parseArtnet);
-    UdpRecorder sntcRec("sntc", opt.sntcPort, opt.fps, parseSntc);
+    UdpRecorder artnetRec("artnet", opt.artnetPort, opt.fps, parseArtnet, opt.outlierJitterMs);
+    UdpRecorder sntcRec("sntc", opt.sntcPort, opt.fps, parseSntc, opt.outlierJitterMs);
     if (opt.enableArtnet && !artnetRec.start(err)) {
         std::cerr << err << "\n";
         return EXIT_FAILURE;
@@ -534,15 +960,31 @@ int main(int argc, char** argv) {
     TimecodeEngine engine;
     engine.seek(0.0);
 
+    constexpr int kSmpteSampleRate = 48000;
+    MidiRecorder midiRec(opt.fps, opt.outlierJitterMs);
+    LtcRecorder ltcRec(opt.fps, kSmpteSampleRate, opt.outlierJitterMs);
+
     SmpteOutput smpte(engine);
     MidiOutput midi(engine);
     ArtnetOutput artnet(engine);
     SntcOutput sntc(engine);
 
+    smpte.setLtcSampleProbe([&ltcRec](const unsigned char* samples,
+                                      std::size_t count,
+                                      std::uint64_t firstSample) {
+        ltcRec.observe(samples, count, firstSample);
+    });
+    midi.setMessageProbe([&midiRec](const unsigned char* data,
+                                    std::size_t size,
+                                    Clock::time_point sentAt) {
+        midiRec.observe(data, size, sentAt);
+    });
+
     if (opt.enableSmpte) {
         SmpteSettings s;
         s.enabled = true;
         s.fps = opt.fps;
+        s.sampleRate = kSmpteSampleRate;
         s.level = 0.0f; // run the real callback path silently.
         smpte.applyConfig(s);
     }
@@ -597,19 +1039,26 @@ int main(int argc, char** argv) {
         engine.setPlaybackRate(rate);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        const double expectedInterval = 1.0 / std::max(1.0, nominalFps * rate);
-        if (opt.enableArtnet) artnetRec.begin(rate, expectedInterval);
-        if (opt.enableSntc) sntcRec.begin(rate, expectedInterval);
+        const double expectedFrameInterval = 1.0 / std::max(1.0, nominalFps * rate);
+        const double expectedQuarterInterval = 1.0 / std::max(1.0, nominalFps * rate * 4.0);
 
         engine.play();
+        if (opt.enableArtnet) artnetRec.begin(rate, expectedFrameInterval);
+        if (opt.enableSntc) sntcRec.begin(rate, expectedFrameInterval);
+        if (opt.enableMidi) midiRec.begin(rate, expectedQuarterInterval);
+        if (opt.enableSmpte) ltcRec.begin(rate, expectedFrameInterval);
+
         std::this_thread::sleep_for(
             std::chrono::duration_cast<Clock::duration>(
                 std::chrono::duration<double>(opt.durationSeconds)));
-        engine.pause();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         if (opt.enableArtnet) allStats.push_back(artnetRec.end());
         if (opt.enableSntc) allStats.push_back(sntcRec.end());
+        if (opt.enableMidi) allStats.push_back(midiRec.end());
+        if (opt.enableSmpte) allStats.push_back(ltcRec.end());
+
+        engine.pause();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     loadStop.store(true);
@@ -625,8 +1074,10 @@ int main(int argc, char** argv) {
     sntcRec.stop();
 
     writeReport(opt.reportPath, allStats);
+    writeOutliers(opt.outlierPath, allStats);
     printSummary(allStats);
     std::cout << "Wrote " << opt.reportPath << "\n";
+    std::cout << "Wrote " << opt.outlierPath << "\n";
 
     return evaluateThresholds(opt, allStats) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -12,20 +12,25 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace libera_timecode {
 
 namespace {
 
-void sendFullFrame(RtMidiOut& out, const TimecodeFields& tc, FrameRate fps) {
+std::vector<unsigned char> fullFrameMessage(const TimecodeFields& tc, FrameRate fps) {
     const auto bytes = timecode_protocol::buildMidiFullFrame(tc, fps);
-    std::vector<unsigned char> msg(bytes.begin(), bytes.end());
-    out.sendMessage(&msg);
+    return {bytes.begin(), bytes.end()};
 }
 
-void sendQuarterFrame(RtMidiOut& out, int piece, const TimecodeFields& tc, FrameRate fps) {
+std::vector<unsigned char> quarterFrameMessage(int piece,
+                                               const TimecodeFields& tc,
+                                               FrameRate fps) {
     const auto bytes = timecode_protocol::buildMidiQuarterFrame(piece, tc, fps);
-    std::vector<unsigned char> msg(bytes.begin(), bytes.end());
+    return {bytes.begin(), bytes.end()};
+}
+
+void sendMidiMessage(RtMidiOut& out, const std::vector<unsigned char>& msg) {
     out.sendMessage(&msg);
 }
 
@@ -34,6 +39,12 @@ void sendQuarterFrame(RtMidiOut& out, int piece, const TimecodeFields& tc, Frame
 MidiOutput::MidiOutput(TimecodeEngine& engine) : engine_(engine) {}
 
 MidiOutput::~MidiOutput() { stop(); }
+
+void MidiOutput::setMessageProbe(MessageProbe probe) {
+    std::lock_guard<std::mutex> lock(probeMutex_);
+    messageProbe_ = std::move(probe);
+    messageProbeEnabled_.store(static_cast<bool>(messageProbe_), std::memory_order_release);
+}
 
 std::vector<std::string> MidiOutput::availablePorts() {
     std::vector<std::string> ports;
@@ -85,6 +96,19 @@ std::string MidiOutput::status() const {
     if (!lastError_.empty()) return "Error: " + lastError_;
     if (!running_.load())    return "Idle";
     return "Sending MTC -> " + openPortLabel_;
+}
+
+void MidiOutput::notifyMessageProbe(const unsigned char* data,
+                                    std::size_t size,
+                                    std::chrono::steady_clock::time_point sentAt) {
+    if (!messageProbeEnabled_.load(std::memory_order_acquire)) return;
+
+    MessageProbe probe;
+    {
+        std::lock_guard<std::mutex> lock(probeMutex_);
+        probe = messageProbe_;
+    }
+    if (probe) probe(data, size, sentAt);
 }
 
 void MidiOutput::threadMain() {
@@ -193,7 +217,11 @@ void MidiOutput::threadMain() {
                               && std::abs((nowFn - lockedFrameNumber) - expectedStep) > 2;
 
             if (stateChanged || bigJump || !haveLocked) {
-                try { sendFullFrame(*midi_, nowTc, cfg.fps); }
+                try {
+                    const auto msg = fullFrameMessage(nowTc, cfg.fps);
+                    sendMidiMessage(*midi_, msg);
+                    notifyMessageProbe(msg.data(), msg.size(), clock::now());
+                }
                 catch (RtMidiError& e) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     lastError_ = e.what();
@@ -209,7 +237,11 @@ void MidiOutput::threadMain() {
 
         // Only stream quarter-frames when playing or in clock mode.
         if (snap.playing || snap.clockMode) {
-            try { sendQuarterFrame(*midi_, piece, lockedTc, cfg.fps); }
+            try {
+                const auto msg = quarterFrameMessage(piece, lockedTc, cfg.fps);
+                sendMidiMessage(*midi_, msg);
+                notifyMessageProbe(msg.data(), msg.size(), clock::now());
+            }
             catch (RtMidiError& e) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 lastError_ = e.what();

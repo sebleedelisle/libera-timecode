@@ -19,6 +19,12 @@ SmpteOutput::SmpteOutput(TimecodeEngine& engine) : engine_(engine) {}
 
 SmpteOutput::~SmpteOutput() { stop(); }
 
+void SmpteOutput::setLtcSampleProbe(LtcSampleProbe probe) {
+    std::lock_guard<std::mutex> lock(ltcProbeMutex_);
+    ltcSampleProbe_ = std::move(probe);
+    ltcSampleProbeEnabled_.store(static_cast<bool>(ltcSampleProbe_), std::memory_order_release);
+}
+
 std::vector<std::string> SmpteOutput::availableAudioDevices() {
     std::vector<std::string> names;
     try {
@@ -150,6 +156,7 @@ bool SmpteOutput::openStream(const SmpteSettings& cfg) {
     ltcTimelineActive_ = false;
     ltcTimelineFrameIndex_ = 0;
     ltcTimelineFps_ = cfg.fps;
+    ltcProbeSampleCursor_ = 0;
     channelsOpen_ = 2;
     callbackFpsIndex_.store(indexOfFrameRate(cfg.fps), std::memory_order_release);
 
@@ -190,6 +197,19 @@ void SmpteOutput::closeStream() {
     ltcBuf_.clear();
     ltcBufFill_ = ltcBufRead_ = 0;
     ltcTimelineValid_ = false;
+}
+
+void SmpteOutput::notifyLtcSampleProbe(const unsigned char* samples,
+                                       std::size_t count,
+                                       std::uint64_t firstSample) {
+    if (!ltcSampleProbeEnabled_.load(std::memory_order_acquire)) return;
+
+    LtcSampleProbe probe;
+    {
+        std::lock_guard<std::mutex> lock(ltcProbeMutex_);
+        probe = ltcSampleProbe_;
+    }
+    if (probe) probe(samples, count, firstSample);
 }
 
 void SmpteOutput::controlThreadMain() {
@@ -283,6 +303,13 @@ int SmpteOutput::audioCallback(void* outputBuffer, void* /*inputBuffer*/,
 
                 self->ltcBufFill_ = ltc_encoder_copy_buffer(self->enc_, self->ltcBuf_.data());
                 self->ltcBufRead_ = 0;
+                if (self->ltcBufFill_ > 0) {
+                    const std::uint64_t firstSample = self->ltcProbeSampleCursor_;
+                    self->ltcProbeSampleCursor_ += self->ltcBufFill_;
+                    self->notifyLtcSampleProbe(self->ltcBuf_.data(),
+                                               self->ltcBufFill_,
+                                               firstSample);
+                }
 
                 if (active) {
                     if (!snap.clockMode && snap.rate < -output_timing::kMinActiveRate) {

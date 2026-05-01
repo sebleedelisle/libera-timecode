@@ -3,6 +3,9 @@
 #include "../Settings.h"
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,10 +21,15 @@ class TimecodeEngine;
 
 class SmpteOutput {
 public:
+    using LtcSampleProbe = std::function<void(const unsigned char* samples,
+                                              std::size_t count,
+                                              std::uint64_t firstSample)>;
+
     SmpteOutput(TimecodeEngine& engine);
     ~SmpteOutput();
 
     void applyConfig(const SmpteSettings& config);
+    void setLtcSampleProbe(LtcSampleProbe probe);
     void stop();
     bool running() const { return running_.load(); }
     std::string status() const;
@@ -36,6 +44,9 @@ private:
     void controlThreadMain();
     bool openStream(const SmpteSettings& cfg);
     void closeStream();
+    void notifyLtcSampleProbe(const unsigned char* samples,
+                              std::size_t count,
+                              std::uint64_t firstSample);
 
     TimecodeEngine& engine_;
     std::unique_ptr<RtAudio> audio_;
@@ -59,6 +70,11 @@ private:
     bool ltcTimelineActive_{false};
     long long ltcTimelineFrameIndex_{0};
     FrameRate ltcTimelineFps_{FrameRate::fps_30_NDF};
+    std::uint64_t ltcProbeSampleCursor_{0};
+
+    mutable std::mutex ltcProbeMutex_;
+    LtcSampleProbe ltcSampleProbe_;
+    std::atomic<bool> ltcSampleProbeEnabled_{false};
 
     std::atomic<bool> running_{false};
     std::atomic<bool> shouldStop_{false};

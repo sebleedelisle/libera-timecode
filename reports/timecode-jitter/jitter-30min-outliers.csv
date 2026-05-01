@@ -1,0 +1,1 @@
+protocol,rate,phase_elapsed_ms,expected_ms,interval_ms,abs_jitter_ms,previous_frame,current_frame,frame_step,previous_timecode,current_timecode

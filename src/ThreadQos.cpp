@@ -31,6 +31,9 @@ uint32_t nsToMachTicks(uint64_t ns) {
 
 void setHighPriorityForOutputThread() {
 #ifdef __APPLE__
+    // Give the thread a high QoS even if the realtime policy below is denied.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
     // THREAD_TIME_CONSTRAINT_POLICY is the realtime scheduling class macOS
     // uses for audio threads. It promises us at most `computation` ticks of
     // CPU within every `period` ticks, with a hard `constraint` deadline.
@@ -46,10 +49,18 @@ void setHighPriorityForOutputThread() {
     policy.preemptible = TRUE;
 
     const thread_port_t mach_thread = pthread_mach_thread_np(pthread_self());
-    thread_policy_set(mach_thread,
-                      THREAD_TIME_CONSTRAINT_POLICY,
-                      reinterpret_cast<thread_policy_t>(&policy),
-                      THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    const kern_return_t rv = thread_policy_set(mach_thread,
+                                               THREAD_TIME_CONSTRAINT_POLICY,
+                                               reinterpret_cast<thread_policy_t>(&policy),
+                                               THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (rv != KERN_SUCCESS) {
+        thread_precedence_policy_data_t precedence{};
+        precedence.importance = 63;
+        thread_policy_set(mach_thread,
+                          THREAD_PRECEDENCE_POLICY,
+                          reinterpret_cast<thread_policy_t>(&precedence),
+                          THREAD_PRECEDENCE_POLICY_COUNT);
+    }
 #elif defined(_WIN32)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 #else
