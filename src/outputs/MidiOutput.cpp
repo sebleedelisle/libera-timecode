@@ -1,6 +1,7 @@
 #include "MidiOutput.h"
 
 #include "OutputTiming.h"
+#include "TimecodeProtocol.h"
 
 #include "../ThreadQos.h"
 #include "../TimecodeEngine.h"
@@ -16,49 +17,15 @@ namespace libera_timecode {
 
 namespace {
 
-uint8_t mtcRateCode(FrameRate r) {
-    switch (r) {
-    case FrameRate::fps_23_976:
-    case FrameRate::fps_24:        return 0;
-    case FrameRate::fps_25:        return 1;
-    case FrameRate::fps_29_97_DF:
-    case FrameRate::fps_29_97_NDF: return 2;
-    case FrameRate::fps_30_DF:
-    case FrameRate::fps_30_NDF:    return 3;
-    }
-    return 3;
-}
-
-void sendFullFrame(RtMidiOut& out, const TimecodeFields& tc, uint8_t rateCode) {
-    // F0 7F 7F 01 01 hh mm ss ff F7
-    std::vector<unsigned char> msg{
-        0xF0, 0x7F, 0x7F, 0x01, 0x01,
-        static_cast<unsigned char>(((rateCode & 0x03) << 5) | (tc.hours & 0x1F)),
-        static_cast<unsigned char>(tc.minutes & 0x3F),
-        static_cast<unsigned char>(tc.seconds & 0x3F),
-        static_cast<unsigned char>(tc.frames  & 0x1F),
-        0xF7,
-    };
+void sendFullFrame(RtMidiOut& out, const TimecodeFields& tc, FrameRate fps) {
+    const auto bytes = timecode_protocol::buildMidiFullFrame(tc, fps);
+    std::vector<unsigned char> msg(bytes.begin(), bytes.end());
     out.sendMessage(&msg);
 }
 
-void sendQuarterFrame(RtMidiOut& out, int piece, const TimecodeFields& tc, uint8_t rateCode) {
-    // piece 0..7 chooses which nibble. F1 0xMV where M = piece, V = nibble value.
-    uint8_t value = 0;
-    switch (piece) {
-    case 0: value = tc.frames  & 0x0F; break;
-    case 1: value = (tc.frames  >> 4) & 0x01; break;
-    case 2: value = tc.seconds & 0x0F; break;
-    case 3: value = (tc.seconds >> 4) & 0x03; break;
-    case 4: value = tc.minutes & 0x0F; break;
-    case 5: value = (tc.minutes >> 4) & 0x03; break;
-    case 6: value = tc.hours   & 0x0F; break;
-    case 7: value = ((tc.hours  >> 4) & 0x01) | ((rateCode & 0x03) << 1); break;
-    }
-    std::vector<unsigned char> msg{
-        0xF1,
-        static_cast<unsigned char>(((piece & 0x07) << 4) | (value & 0x0F)),
-    };
+void sendQuarterFrame(RtMidiOut& out, int piece, const TimecodeFields& tc, FrameRate fps) {
+    const auto bytes = timecode_protocol::buildMidiQuarterFrame(piece, tc, fps);
+    std::vector<unsigned char> msg(bytes.begin(), bytes.end());
     out.sendMessage(&msg);
 }
 
@@ -226,7 +193,7 @@ void MidiOutput::threadMain() {
                               && std::abs((nowFn - lockedFrameNumber) - expectedStep) > 2;
 
             if (stateChanged || bigJump || !haveLocked) {
-                try { sendFullFrame(*midi_, nowTc, mtcRateCode(cfg.fps)); }
+                try { sendFullFrame(*midi_, nowTc, cfg.fps); }
                 catch (RtMidiError& e) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     lastError_ = e.what();
@@ -242,7 +209,7 @@ void MidiOutput::threadMain() {
 
         // Only stream quarter-frames when playing or in clock mode.
         if (snap.playing || snap.clockMode) {
-            try { sendQuarterFrame(*midi_, piece, lockedTc, mtcRateCode(cfg.fps)); }
+            try { sendQuarterFrame(*midi_, piece, lockedTc, cfg.fps); }
             catch (RtMidiError& e) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 lastError_ = e.what();

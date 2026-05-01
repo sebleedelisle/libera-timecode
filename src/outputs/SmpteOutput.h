@@ -52,6 +52,9 @@ private:
     std::size_t ltcBufFill_{0};
     int frameNumberLastEncoded_{-1};
     int channelsOpen_{2};
+    std::atomic<float> callbackLevel_{0.5f};
+    std::atomic<int> callbackChannelMode_{2};
+    std::atomic<int> callbackFpsIndex_{static_cast<int>(FrameRate::fps_30_NDF)};
     bool ltcTimelineValid_{false};
     bool ltcTimelineActive_{false};
     long long ltcTimelineFrameIndex_{0};

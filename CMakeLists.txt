@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(LiberaTimecode VERSION 0.1.0 LANGUAGES C CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -169,4 +170,21 @@ if(APPLE)
         MACOSX_BUNDLE_ICON_FILE "libera-timecode.icns"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
     )
+endif()
+
+# ---------------- Tests ----------------
+
+if(BUILD_TESTING)
+    add_executable(libera_timecode_tests
+        tests/timecode_tests.cpp
+        src/Timecode.cpp
+    )
+    target_include_directories(libera_timecode_tests PRIVATE src)
+    target_link_libraries(libera_timecode_tests PRIVATE libera_timecode_ltc)
+    if(MSVC)
+        target_compile_options(libera_timecode_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(libera_timecode_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME libera_timecode_tests COMMAND libera_timecode_tests)
 endif()

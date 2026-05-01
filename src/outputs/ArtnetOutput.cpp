@@ -1,6 +1,7 @@
 #include "ArtnetOutput.h"
 
 #include "OutputTiming.h"
+#include "TimecodeProtocol.h"
 
 #include "../ThreadQos.h"
 #include "../TimecodeEngine.h"
@@ -9,27 +10,6 @@
 #include <cstring>
 
 namespace libera_timecode {
-
-namespace {
-
-uint8_t artnetTypeForFps(FrameRate r) {
-    // Art-Net spec only defines four codes:
-    //   0 Film (24fps)   1 EBU (25fps)   2 DF (29.97 DF)   3 SMPTE (30 NDF)
-    // 23.976 maps to Film; 29.97 NDF and 30 DF have no exact code, so we
-    // pick the closest match (NDF flavors → SMPTE 30, DF flavors → DF 29.97).
-    switch (r) {
-    case FrameRate::fps_23_976:
-    case FrameRate::fps_24:        return 0;
-    case FrameRate::fps_25:        return 1;
-    case FrameRate::fps_29_97_DF:
-    case FrameRate::fps_30_DF:     return 2;
-    case FrameRate::fps_29_97_NDF:
-    case FrameRate::fps_30_NDF:    return 3;
-    }
-    return 3;
-}
-
-} // namespace
 
 ArtnetOutput::ArtnetOutput(TimecodeEngine& engine) : engine_(engine) {}
 
@@ -111,17 +91,8 @@ void ArtnetOutput::threadMain() {
             const bool frameChanged = (fn != lastSentFrame);
             const bool keepalive = (now - lastSendTime > keepaliveInterval);
             if (frameChanged || keepalive) {
-                uint8_t pkt[19];
-                std::memcpy(pkt, "Art-Net\0", 8);
-                pkt[8]  = 0x00; pkt[9]  = 0x97;
-                pkt[10] = 0;    pkt[11] = 14;
-                pkt[12] = 0;    pkt[13] = 0;
-                pkt[14] = static_cast<uint8_t>(tc.frames);
-                pkt[15] = static_cast<uint8_t>(tc.seconds);
-                pkt[16] = static_cast<uint8_t>(tc.minutes);
-                pkt[17] = static_cast<uint8_t>(tc.hours);
-                pkt[18] = artnetTypeForFps(cfg.fps);
-                if (!sender_.send(pkt, sizeof(pkt))) {
+                const auto pkt = timecode_protocol::buildArtnetTimecodePacket(tc, cfg.fps);
+                if (!sender_.send(pkt.data(), pkt.size())) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     lastError_ = "sendto failed";
                 } else {
