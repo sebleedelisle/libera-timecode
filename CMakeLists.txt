@@ -172,6 +172,31 @@ if(APPLE)
     )
 endif()
 
+# ---------------- Timing harness ----------------
+
+add_executable(libera_timecode_jitter
+    tools/jitter_harness.cpp
+    src/ThreadQos.cpp
+    src/Timecode.cpp
+    src/TimecodeEngine.cpp
+    src/outputs/UdpSender.cpp
+    src/outputs/ArtnetOutput.cpp
+    src/outputs/SntcOutput.cpp
+    src/outputs/MidiOutput.cpp
+    src/outputs/SmpteOutput.cpp
+)
+target_include_directories(libera_timecode_jitter PRIVATE src)
+target_link_libraries(libera_timecode_jitter PRIVATE
+    libera_timecode_ltc
+    libera_timecode_rtmidi
+    rtaudio
+)
+if(MSVC)
+    target_compile_options(libera_timecode_jitter PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(libera_timecode_jitter PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 # ---------------- Tests ----------------
 
 if(BUILD_TESTING)
