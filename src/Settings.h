@@ -53,6 +53,7 @@ struct AppSettings {
     WindowSettings window;
     double tapJumpSeconds{10.0};
     double playbackRate{1.0}; // varispeed multiplier; 1.0 = normal play
+    bool showStatusPanel{true};
     SmpteSettings smpte;
     MidiSettings midi;
     ArtnetSettings artnet;

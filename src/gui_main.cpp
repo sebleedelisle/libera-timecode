@@ -399,17 +399,6 @@ int main() {
 
         drawReadout(app, snap, displayFps, displayFrameOverride);
 
-        // ---------- Status lines ----------
-        ImGui::Spacing();
-        ImGui::BeginChild("##status-lines", ImVec2(0, 100.0f), true);
-        for (const auto& row : rows) {
-            ImGui::TextColored(*row.enabled ? ImVec4(0.7f, 0.95f, 0.75f, 1.0f) : ImVec4(0.55f, 0.6f, 0.65f, 1.0f),
-                               "%s", row.label);
-            ImGui::SameLine(120.0f);
-            ImGui::TextDisabled("%s @ %s", row.status.c_str(), frameRateLabel(*row.fps));
-        }
-        ImGui::EndChild();
-
         // ---------- Transport ----------
         ImGui::Spacing();
         const float btnSize = 56.0f;
@@ -502,7 +491,8 @@ int main() {
         {
             const float controlWidth = 240.0f;
             const float buttonWidth = 60.0f;
-            const float total = controlWidth + 8.0f + buttonWidth + 8.0f + 60.0f;
+            const float statusButtonWidth = 34.0f;
+            const float total = controlWidth + 8.0f + buttonWidth + 8.0f + statusButtonWidth + 8.0f + 60.0f;
             const float startX = (ImGui::GetContentRegionAvail().x - total) * 0.5f;
             if (startX > 0) {
                 ImGui::Dummy(ImVec2(startX, 1));
@@ -526,12 +516,31 @@ int main() {
                 engine.setPlaybackRate(1.0);
                 settingsDirty = true;
             }
+            ImGui::SameLine();
+            const char* statusIcon = settings.showStatusPanel ? ICON_FK_EYE : ICON_FK_EYE_SLASH;
+            if (ImGui::Button(statusIcon, ImVec2(statusButtonWidth, 0))) {
+                settings.showStatusPanel = !settings.showStatusPanel;
+                settingsDirty = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s status panel", settings.showStatusPanel ? "Hide" : "Show");
+            }
         }
 
-        // Help line
-        ImGui::Spacing();
-        ImGui::TextDisabled("Tap rewind/FF to jump %.0fs. Hold to scrub (ramps to 8x). Clock icon: send wall time.",
-                            settings.tapJumpSeconds);
+        // ---------- Status lines ----------
+        if (settings.showStatusPanel) {
+            ImGui::Spacing();
+            ImGui::BeginChild("##status-lines",
+                              ImVec2(0.0f, 0.0f),
+                              ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+            for (const auto& row : rows) {
+                ImGui::TextColored(*row.enabled ? ImVec4(0.7f, 0.95f, 0.75f, 1.0f) : ImVec4(0.55f, 0.6f, 0.65f, 1.0f),
+                                   "%s", row.label);
+                ImGui::SameLine(120.0f);
+                ImGui::TextDisabled("%s @ %s", row.status.c_str(), frameRateLabel(*row.fps));
+            }
+            ImGui::EndChild();
+        }
 
         ImGui::End();
 

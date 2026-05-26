@@ -8,3 +8,4 @@ build-*/
 *.swo
 *~
 CMakeUserPresets.json
+/jitter-30min*.csv
