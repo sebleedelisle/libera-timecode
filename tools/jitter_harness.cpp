@@ -33,6 +33,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -58,6 +61,18 @@ namespace {
 
 using namespace libera_timecode;
 using Clock = std::chrono::steady_clock;
+
+socket_t invalidSocket() {
+#ifdef _WIN32
+    return INVALID_SOCKET;
+#else
+    return -1;
+#endif
+}
+
+bool socketValid(socket_t socket) {
+    return socket != invalidSocket();
+}
 
 struct Options {
     double durationSeconds{60.0};
@@ -312,7 +327,7 @@ public:
 
     bool start(std::string& error) {
         socket_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (fd < 0) {
+        if (!socketValid(fd)) {
             error = "socket() failed";
             return false;
         }
@@ -339,9 +354,9 @@ public:
     void stop() {
         stop_.store(true);
         if (thread_.joinable()) thread_.join();
-        if (socket_ >= 0) {
+        if (socketValid(socket_)) {
             CLOSE_SOCKET(socket_);
-            socket_ = -1;
+            socket_ = invalidSocket();
         }
     }
 
@@ -459,7 +474,7 @@ private:
     FrameRate fps_;
     Parser parser_;
     double outlierJitterMs_{1.0};
-    socket_t socket_{-1};
+    socket_t socket_{invalidSocket()};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 
@@ -652,7 +667,7 @@ public:
             ltc_decoder_free(decoder_);
             decoder_ = nullptr;
         }
-        const int apv = std::max(1, static_cast<int>(
+        const int apv = (std::max)(1, static_cast<int>(
             std::lround(static_cast<double>(sampleRate_)
                         / ltc_protocol::effectiveFps(fps_))));
         decoder_ = ltc_decoder_create(apv, 64);
@@ -1039,8 +1054,8 @@ int main(int argc, char** argv) {
         engine.setPlaybackRate(rate);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        const double expectedFrameInterval = 1.0 / std::max(1.0, nominalFps * rate);
-        const double expectedQuarterInterval = 1.0 / std::max(1.0, nominalFps * rate * 4.0);
+        const double expectedFrameInterval = 1.0 / (std::max)(1.0, nominalFps * rate);
+        const double expectedQuarterInterval = 1.0 / (std::max)(1.0, nominalFps * rate * 4.0);
 
         engine.play();
         if (opt.enableArtnet) artnetRec.begin(rate, expectedFrameInterval);
