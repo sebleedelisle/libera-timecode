@@ -26,14 +26,12 @@ jobs:
             artifact: libera-timecode-linux
             pr_artifact_paths: |
               build/libera_timecode
-              build/libera_timecode_jitter
             package_path: libera-timecode-linux.AppImage
           - os: windows-latest
             preset: win-release
             artifact: libera-timecode-windows
             pr_artifact_paths: |
               build/Release/libera_timecode.exe
-              build/Release/libera_timecode_jitter.exe
             package_path: libera-timecode-windows.zip
 
     runs-on: ${{ matrix.os }}
@@ -206,6 +204,12 @@ jobs:
             --desktop-file libera-timecode.desktop \
             --icon-file libera-timecode.png
 
+          if find AppDir -name 'libera_timecode_jitter*' | grep -q .; then
+            echo "ERROR: jitter harness must not be included in the Linux package"
+            find AppDir -name 'libera_timecode_jitter*'
+            exit 1
+          fi
+
           export OUTPUT=libera-timecode-linux.AppImage
           ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
 
@@ -215,8 +219,12 @@ jobs:
         run: |
           mkdir -p staging/libera-timecode
           cp build/Release/libera_timecode.exe staging/libera-timecode/
-          cp build/Release/libera_timecode_jitter.exe staging/libera-timecode/
           cd staging && 7z a ../libera-timecode-windows.zip libera-timecode
+
+          if 7z l ../libera-timecode-windows.zip | grep -q 'libera_timecode_jitter'; then
+            echo "ERROR: jitter harness must not be included in the Windows package"
+            exit 1
+          fi
 
       - name: Upload PR build artifact
         if: github.event_name == 'pull_request'
