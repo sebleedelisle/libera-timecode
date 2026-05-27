@@ -14,6 +14,8 @@ The app can run from an internal transport or send wall-clock time. Supported
 frame rates include 23.976, 24, 25, 29.97 drop-frame, 29.97 non-drop-frame,
 30 drop-frame, and 30 non-drop-frame.
 
+![Libera Timecode main window](docs/images/libera-timecode-main.png)
+
 ## Using The App
 
 Start Libera Timecode, choose the frame rate and output types you need, then
@@ -51,6 +53,9 @@ Useful targets:
 
 GitHub Actions builds macOS, Linux, and Windows artifacts. Pushes to `main`
 produce packaged artifacts, and tags matching `v*` create a GitHub Release.
+
+Download the latest packaged release from
+[GitHub Releases](https://github.com/sebleedelisle/libera-timecode/releases).
 
 See [CI and release](docs/ci-release.md).
 
